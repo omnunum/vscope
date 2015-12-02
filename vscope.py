@@ -10,6 +10,7 @@ from os import path as osp
 import os
 
 from pprint import pprint as pp
+import argparse
 
 
 class Image:
@@ -20,10 +21,8 @@ class Image:
         'width',
         'description',
         'tags',
-        'preset',
         'permalink',
         'responsive_url',
-        'image_meta',
         '_id',
         'is_video',
         'grid_name',
@@ -32,9 +31,9 @@ class Image:
     )
     supplementary_attributes_to_flatten = {
         'iso': ('image_meta', 'ios'),
-        'phone_model': ('image_meta', 'model'),
-        'phone_make': ('image_meta', 'make'),
-        'preset': ('preset', 'key'),
+        'model': ('image_meta', 'model'),
+        'make': ('image_meta', 'make'),
+        'preset': ('preset', 'short_name'),
         'preset_bg_color': ('preset', 'color')
     }
 
@@ -49,6 +48,10 @@ class Image:
         tvp = self.top_level_attributes
         self.details = {k: details.get(k, None) for k in tvp}
         self.details.update(self._flatten_supplementary_attributes())
+        self.details['camera'] = '{} {}'.format(
+            self.details['make'],
+            self.details['model']
+        )
 
         for param, value in self.details.iteritems():
             self.__dict__[param] = value
@@ -102,15 +105,25 @@ class Image:
 
 
 class Grid:
-    def __init__(self, url='slowed.vsco.co', user_id=None):
+    def __init__(self, url='slowed.vsco.co',
+                 user_id=None, cached_image_width=300,
+                 auto_cache_images=True
+                 ):
         self.subdomain = self._strip_away_url_elements(url)
         self._enforce_directories()
 
         self.session = self.s = rq.Session()
+        init_session_cookies = self._grab_session_response('http://grid.vsco.co/grid/1/')
 
-        self.user_id = self._grab_user_id_of_owner() \
-            if not user_id else user_id
-        gen_images_300_px_wide = self._generate_images(cached_image_width=300)
+        if self.subdomain == 'grid':
+            self.user_id = 113950
+        else:
+            self.user_id = self._grab_user_id_of_owner() \
+                if not user_id else user_id
+
+        gen_images_300_px_wide = self._generate_images(
+            cached_image_width=cached_image_width
+        )
         self.images = [image for image in gen_images_300_px_wide]
 
     def _enforce_directories(self):
@@ -146,9 +159,11 @@ class Grid:
         soup_meta = soup.find_all('meta', property='al:ios:url')
         user_app_url = soup_meta[0].get('content', None)
         matcher = 'user/(?P<user_id>\d+)/grid'
-        user_id = re.search(matcher, user_app_url).group('user_id')
-
-        return user_id
+        match = re.search(matcher, user_app_url)
+        if match:
+            return match.group('user_id')
+        else:
+            print(user_app_url)
 
     def _grab_metadata(self):
         media_url_formatter = lambda username, token, uid, size: \
@@ -189,8 +204,13 @@ class Grid:
 
     @property
     def access_token(self):
-        assert 'vs' in self.s.cookies
-        return self.s.cookies['vs']
+        try:
+            return self.s.cookies['vs']
+        except KeyError as e:
+            cooks = rq.utils.dict_from_cookiejar(self.s.cookies)
+            pp(cooks, indent=4)
+            pp(e.message)
+            raise
 
     @property
     def size(self):
@@ -222,7 +242,11 @@ class Grid:
             histogram = {k: (v / total) for k, v in histogram.iteritems()}
 
         items = histogram.items()
-        items_sorted = sorted(items, key=lambda t: t[1], reverse=(not ascending))
+        items_sorted = sorted(
+            items,
+            key=lambda t: t[1],
+            reverse=(not ascending)
+        )
         ordered = OrderedDict(items_sorted)
 
         return ordered
@@ -233,8 +257,25 @@ class Analyzer:
         pass
 
 if '__main__' in __name__:
-    grid = Grid(url='luciomx')
-    histo = grid.histogram_attribute('preset')
+    parser = argparse.ArgumentParser(prog='PROG')
+    parser.add_argument('subdomain',
+                        help='Can be either the subdomain \
+                         or full url of anything with the subdomain in it',
+                        default='slowed'
+                        )
+    parser.add_argument('--hist',
+                        help='Specify an Image Parameter to bin the frequencies \
+                        of the different values',
+                        default='preset'
+                        )
+    parser.add_argument('--auto-cache',
+                        help='Automatically download and cache all images in grid',
+                        type=bool,
+                        default='True'
+                        )
+    args = parser.parse_args()
+    grid = Grid(url=args.subdomain, auto_cache_images=args.auto_cache)
+    histo = grid.histogram_attribute(args.hist)
     pp(histo, indent=4)
     for k, v in histo.items():
         print '{}: {}'.format(k, v)
