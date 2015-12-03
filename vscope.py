@@ -11,6 +11,11 @@ import os
 
 from pprint import pprint as pp
 import argparse
+import scipy
+from skimage import color
+from skimage import io
+from sklearn import cluster
+import numpy as np
 
 
 class Image:
@@ -63,8 +68,15 @@ class Image:
 
         self.session = self.s = session
 
-        if auto_download_file:
-            self.download_file()
+        self.link = 'http://{}?w={}'.format(
+            self.responsive_url, self.cached_image_width
+        )
+        self.local_filename = 'images/{}/{}-{}.jpg'.format(
+            self.perma_subdomain, self._id, self.cached_image_width
+        )
+
+        if auto_download_file and not osp.isfile(self.local_filename):
+            self.cache_image_file()
 
     def __repr__(self):
         return json.dumps(self.details)
@@ -86,22 +98,30 @@ class Image:
         if not osp.isdir(path):
             os.makedirs(path)
 
-    def download_file(self):
-        link = 'http://{}?w={}'.format(
-            self.responsive_url, self.cached_image_width
-        )
-        local_filename = 'images/{}/{}-{}.jpg'.format(
-            self.perma_subdomain, self._id, self.cached_image_width
-        )
+    @property
+    def data_array_rgb(self):
+        if hasattr(self, '_image_data_rgb'):
+            return self._image_data_rgb
+        else:
+            if not osp.isfile(self.local_filename):
+                self.cache_image_file()
+            img = io.imread(self.local_filename)
+            self._image_data_rgb = img
 
-        if not osp.isfile(local_filename):
-            r = self.s.get(link, stream=True)
+            return img
 
-            if r.status_code == codes.all_good:
-                with open(local_filename, 'wb') as f:
-                    r.raw.decode_content = True
-                    for chunk in r.iter_content(2048):
-                        f.write(chunk)
+    @property
+    def data_array_lab(self):
+        return color.rgb2lab(self.data_array_rgb)
+
+    def cache_image_file(self):
+        r = self.s.get(self.link, stream=True)
+
+        if r.status_code == codes.all_good:
+            with open(self.local_filename, 'wb') as f:
+                r.raw.decode_content = True
+                for chunk in r.iter_content(2048):
+                    f.write(chunk)
 
 
 class Grid:
@@ -255,6 +275,31 @@ class Grid:
 class Analyzer:
     def __init__(self, grid, *args, **kwargs):
         pass
+
+    @staticmethod
+    def find_primary_colors(image, resolve_to_n_colors=20):
+        k = resolve_to_n_colors
+        lab = image.data_array_lab
+        shape = lab.shape
+
+        centroids, centroid_ixs, intertia = cluster.k_means(
+            np.reshape(
+                lab,
+                (shape[0] * shape[1], shape[2])
+            ),
+            k
+        )
+
+        hist = np.histogram(centroid_ixs, bins=k, range=[0, k])
+        freqs = hist[0].tolist()
+        bins = hist[1].astype(int).tolist()
+        top_centroids_ixs = [x[0] for x in sorted(zip(bins, freqs), key=lambda x: x[1], reverse=True)]
+        top_colors_lab = [centroids[c] for c in top_centroids_ixs]
+        lab_shaped = np.reshape(top_colors_lab, (1, k, 3))
+        top_colors_rgb = (color.lab2rgb(lab_shaped) * 255).astype(int)
+
+        return top_colors_rgb
+
 
 if '__main__' in __name__:
     parser = argparse.ArgumentParser(prog='PROG')
