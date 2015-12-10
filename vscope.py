@@ -8,14 +8,19 @@ import json
 from collections import defaultdict, OrderedDict
 from os import path as osp
 import os
+import sys
 
 from pprint import pprint as pp
 import argparse
-import scipy
 from skimage import color
 from skimage import io
 from sklearn import cluster
 import numpy as np
+import math
+from threading import Thread
+import threading
+from multiprocessing import Queue
+from Queue import Empty
 
 
 class Image:
@@ -60,6 +65,7 @@ class Image:
 
         for param, value in self.details.iteritems():
             self.__dict__[param] = value
+            self._add_param(param, value)
 
         self._enforce_directories()
 
@@ -80,6 +86,9 @@ class Image:
 
     def __repr__(self):
         return json.dumps(self.details)
+
+    def _add_param(self, name, value):
+        self.details[name] = value
 
     def _flatten_supplementary_attributes(self):
         flattened = {}
@@ -102,17 +111,28 @@ class Image:
     def data_array_rgb(self):
         if hasattr(self, '_image_data_rgb'):
             return self._image_data_rgb
-        else:
-            if not osp.isfile(self.local_filename):
-                self.cache_image_file()
-            img = io.imread(self.local_filename)
-            self._image_data_rgb = img
 
-            return img
+        if not osp.isfile(self.local_filename):
+            self.cache_image_file()
+
+        img = io.imread(self.local_filename)
+        self._image_data_rgb = img
+
+        return img
 
     @property
     def data_array_lab(self):
         return color.rgb2lab(self.data_array_rgb)
+
+    @property
+    def primary_colors(self):
+        if hasattr(self, 'primary_colors'):
+            return self.primary_colors
+
+        primary_colors = Analyzer.find_primary_colors(self)
+        self._add_param('primary_colors', primary_colors)
+
+        return primary_colors
 
     def cache_image_file(self):
         r = self.s.get(self.link, stream=True)
@@ -125,39 +145,36 @@ class Image:
 
 
 class Grid:
-    def __init__(self, url='slowed.vsco.co',
+    vsco_grid_url = 'http://vsco.co/grid/grid/1/'
+    vsco_grid_site_id = 113950
+
+    def __init__(self, subdomain='slowed',
                  user_id=None, cached_image_width=300,
                  auto_cache_images=True
                  ):
-        self.subdomain = self._strip_away_url_elements(url)
+        self.cached_image_width = cached_image_width
+        self.auto_cache_images = auto_cache_images
+
+        self.subdomain = subdomain
         self._enforce_directories()
 
         self.session = self.s = rq.Session()
-        init_session_cookies = self._grab_session_response('http://grid.vsco.co/grid/1/')
+        self.s.headers.update({
+            'User-Agent': '''Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3)
+                              AppleWebKit/537.75.14 (KHTML, like Gecko)
+                              Version/7.0.3 Safari/7046A194A'''
+        })
 
         if self.subdomain == 'grid':
-            self.user_id = 113950
+            self.user_id = self.vsco_grid_site_id
         else:
             self.user_id = self._grab_user_id_of_owner() \
                 if not user_id else user_id
-
-        gen_images_300_px_wide = self._generate_images(
-            cached_image_width=cached_image_width
-        )
-        self.images = [image for image in gen_images_300_px_wide]
 
     def _enforce_directories(self):
         path = 'meta/{}/'.format(self.subdomain)
         if not osp.isdir(path):
             os.makedirs(path)
-
-    def _strip_away_url_elements(self, url):
-        subdomain_searcher = '(https?:\/\/)?(?P<subdomain>\w+)\.vsco\.co'
-        matched = re.search(subdomain_searcher, url)
-        if matched:
-            return matched.group('subdomain')
-        else:
-            return url
 
     def _grab_session_response(self, url):
         return self.session.get(url)
@@ -183,33 +200,54 @@ class Grid:
         if match:
             return match.group('user_id')
         else:
-            print(user_app_url)
+            print('couldn\'t get the user_id out of: {}'.format(user_app_url))
 
-    def _grab_metadata(self):
-        media_url_formatter = lambda username, token, uid, size: \
-            'https://{}.vsco.co/ajxp/{}/2.0/medias?site_id={}&page=1&size={}'\
-            .format(username, token, uid, size)
-        media_url_formatter__user = lambda size: \
+    def _grab_token(self):
+        soup = self._grab_html_soup(self.vsco_grid_url)
+        soup_meta = soup.find_all('meta', property='og:image')
+        tokenized_url = soup_meta[0].get('content', None)
+        matcher = 'https://im.vsco.co/\d/[0-9a-fA-F]*/(?P<token>[0-9a-fA-F]*)/'
+        match = re.search(matcher, tokenized_url)
+        if match:
+            return match.group('token')
+        else:
+            print('couldn\'t get the token out of: {}'.format(tokenized_url))
+
+    def _media_urls(self, page_limit=None, page_size=1000):
+        media_url_formatter = lambda token, uid, page: \
+            'https://vsco.co/ajxp/{}/2.0/medias?site_id={}&page={}&size={}'\
+            .format(token, uid, page, page_size)
+        media_url_formatter__page = lambda page: \
             media_url_formatter(
-                self.subdomain, self.access_token,
-                self.user_id, size
+                self.access_token,
+                self.user_id,
+                page
             )
 
-        media_meta_url = media_url_formatter__user(1)
+        media_meta_url = media_url_formatter__page(1)
+        print('media_meta_url is : {}'.format(media_meta_url))
         media_meta = mm = self._grab_json(media_meta_url)
+        pp(media_meta, indent=4)
         media_meta_all = media_meta['media']
 
         mm_remaining_count = mm['total'] - mm['size']
+        if not page_limit:
+            page_limit = int(math.ceil(mm_remaining_count / 1000))
+        urls = []
         if mm_remaining_count > 0:
-            mm_remaining_url = media_url_formatter__user(mm_remaining_count)
-            mm_remaining = self._grab_json(mm_remaining_url)
-            media_meta_all.extend(mm_remaining['media'])
+            for page in range(2, page_limit):
+                urls.append(media_url_formatter__page(page))
 
-        return media_meta_all
+        return urls
 
-    def _generate_images(self, cached_image_width=None):
-        for meta in tqdm(self._grab_metadata()):
-            yield Image(meta, self.s, cached_image_width=cached_image_width)
+    def _generate_images(self):
+        for meta in tqdm(self.metadata):
+            yield Image(
+                meta,
+                self.s,
+                cached_image_width=self.cached_image_width,
+                auto_download_file=self.auto_cache_images
+            )
 
     def _cache_image_metadata(self):
         metadata = [i.details_full for i in self.images]
@@ -219,22 +257,23 @@ class Grid:
 
     @property
     def grid_url(self):
-        url_base = 'https://{}.vsco.co/grid/1'
+        url_base = 'https://vsco.co/{}/grid/1'
         return url_base.format(self.subdomain)
 
     @property
     def access_token(self):
-        try:
-            return self.s.cookies['vs']
-        except KeyError as e:
-            cooks = rq.utils.dict_from_cookiejar(self.s.cookies)
-            pp(cooks, indent=4)
-            pp(e.message)
-            raise
+        token = self.s.cookies.get('vs', domain='vsco.co', default=None)
+        if not token:
+            token = self._grab_token()
+            self.s.cookies.set('vs', token, domain='vsco.co')
+        return token
 
     @property
     def size(self):
         return len(self.images)
+
+    def paginated_media_urls(self, page_limit=None):
+        return self._media_urls(page_limit=page_limit)
 
     def grid_page_url(self, page):
         return self.grid_url.replace('1', str(page))
@@ -283,17 +322,21 @@ class Analyzer:
         shape = lab.shape
 
         centroids, centroid_ixs, intertia = cluster.k_means(
-            np.reshape(
-                lab,
-                (shape[0] * shape[1], shape[2])
-            ),
+            np.reshape(lab, (shape[0] * shape[1], shape[2])),
             k
         )
 
         hist = np.histogram(centroid_ixs, bins=k, range=[0, k])
         freqs = hist[0].tolist()
         bins = hist[1].astype(int).tolist()
-        top_centroids_ixs = [x[0] for x in sorted(zip(bins, freqs), key=lambda x: x[1], reverse=True)]
+
+        sorted_hist = sorted(
+            zip(bins, freqs),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        top_centroids_ixs = [x[0] for x in sorted_hist]
         top_colors_lab = [centroids[c] for c in top_centroids_ixs]
         lab_shaped = np.reshape(top_colors_lab, (1, k, 3))
         top_colors_rgb = (color.lab2rgb(lab_shaped) * 255).astype(int)
@@ -301,26 +344,126 @@ class Analyzer:
         return top_colors_rgb
 
 
+class StoppableThread(Thread):
+    def __init__(self):
+        super(StoppableThread, self).__init__()
+        self.stoprequest = threading.Event()
+
+    def join(self, timeout=None):
+        self.stoprequest.set()
+        super(StoppableThread, self).join(timeout)
+
+
+class ThreadWebRequest(StoppableThread):
+    def __init__(self, queue_in, queue_out, session=None):
+        self.qi = queue_in
+        self.qo = queue_out
+        self.s = session
+        super(ThreadWebRequest, self).__init__()
+
+    def run(self):
+        while not self.stoprequest.isSet():
+            try:
+                url = self.qi.get(True, 0.05)
+            except Empty:
+                    continue
+            if self.s:
+                r = self.s.get(url)
+            else:
+                r = rq.get(url)
+            if r.status_code == codes.all_good:
+                json_response = r.json()
+                media_entries = json_response['media']
+
+                media_dict = {}
+                for entry in media_entries:
+                    media_dict[entry['_id']] = entry
+
+                self.qo.put(media_dict)
+
+
+class ThreadJSONWriter(StoppableThread):
+    def __init__(self, queue_in, filename):
+        self.filename = filename
+        self.qi = queue_in
+        self.file_exists = osp.isfile(filename)
+        super(ThreadJSONWriter, self).__init__()
+
+    def run(self):
+        filemode = 'rw+' if self.file_exists else 'w'
+        i = 0
+        with open(self.filename, filemode) as f:
+            try:
+                metadata_dict = json.load(f) if self.file_exists else {}
+            except ValueError:
+                metadata_dict = {}
+
+            while not self.stoprequest.isSet():
+                try:
+                    json_chunk = self.qi.get(True, 0.05)
+                except Empty:
+                    continue
+                metadata_dict.update(json_chunk)
+                print('Updated dict with page: {}'.format(i))
+                i += 1
+            json.dump(metadata_dict, f, indent=4)
+
+
+def ap(path):
+    """
+        Gets the absolute path of the directory and appends the path to it.
+    """
+    return osp.join(osp.dirname(osp.abspath(sys.argv[0])), path)
+
+
 if '__main__' in __name__:
+    thread_pool_size = 5
+
     parser = argparse.ArgumentParser(prog='PROG')
     parser.add_argument('subdomain',
-                        help='Can be either the subdomain \
-                         or full url of anything with the subdomain in it',
+                        help='''Can be either the subdomain
+                         or full url of anything with the subdomain in it''',
                         default='slowed'
                         )
     parser.add_argument('--hist',
-                        help='Specify an Image Parameter to bin the frequencies \
-                        of the different values',
+                        help='''Specify an Image Parameter to bin the
+                         frequencies of the different values''',
                         default='preset'
                         )
     parser.add_argument('--auto-cache',
-                        help='Automatically download and cache all images in grid',
+                        help='''Automatically download and cache all images
+                                 in grid''',
                         type=bool,
-                        default='True'
+                        default='False'
                         )
     args = parser.parse_args()
-    grid = Grid(url=args.subdomain, auto_cache_images=args.auto_cache)
-    histo = grid.histogram_attribute(args.hist)
-    pp(histo, indent=4)
-    for k, v in histo.items():
-        print '{}: {}'.format(k, v)
+
+    grid = Grid(subdomain=args.subdomain, auto_cache_images=args.auto_cache)
+    grid_metadata_filename = '{}.json'.format(args.subdomain)
+    grid_metadata_filepath = ap(osp.join('meta', grid_metadata_filename))
+
+    web_request_queue = Queue()
+    json_serializing_queue = Queue()
+
+    for url in grid.paginated_media_urls():
+        web_request_queue.put(url)
+
+    web_thread = lambda: ThreadWebRequest(
+        web_request_queue,
+        json_serializing_queue,
+        grid.session
+    )
+
+    web_pool = [web_thread() for x in range(thread_pool_size)]
+    json_serializer = ThreadJSONWriter(
+        json_serializing_queue,
+        grid_metadata_filepath
+    )
+
+    for thread in web_pool:
+        thread.start()
+    json_serializer.start()
+
+    for thread in web_pool:
+        thread.join()
+    json_serializer.join()
