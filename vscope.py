@@ -14,8 +14,8 @@ from tqdm import tqdm
 from skimage import color
 from skimage import io
 
-from shared import ap, grab_logger, list_of_dicts_to_dict, dump_json
-from threads import ThreadJSONWriter, ThreadMetadataRequest
+from shared import ap, grab_logger, list_of_dicts_to_dict, dump_json, load_json
+from threads import ThreadJSONWriter, ThreadMetadataRequest, ThreadCacheImageData
 from analyzer import Analyzer
 
 log = grab_logger()
@@ -49,7 +49,6 @@ class Image:
                  details,
                  session,
                  cached_image_width=None,
-                 auto_download_file=True,
                  ):
         self._raw_details = details
 
@@ -78,9 +77,6 @@ class Image:
         self.local_filename = 'images/{}/{}-{}.jpg'.format(
             self.perma_subdomain, self._id, self.cached_image_width
         )
-
-        if auto_download_file and not osp.isfile(self.local_filename):
-            self.cache_image_file()
 
     def __repr__(self):
         return json.dumps(self.details)
@@ -138,7 +134,7 @@ class Image:
         if r.status_code == codes.all_good:
             with open(self.local_filename, 'wb') as f:
                 r.raw.decode_content = True
-                for chunk in r.iter_content(2048):
+                for chunk in r.iter_content(1024):
                     f.write(chunk)
 
 
@@ -146,13 +142,7 @@ class Grid:
     vsco_grid_url = 'http://vsco.co/grid/grid/1/'
     vsco_grid_site_id = 113950
 
-    def __init__(self, subdomain='slowed',
-                 user_id=None, cached_image_width=300,
-                 auto_cache_images=True
-                 ):
-        self.cached_image_width = cached_image_width
-        self.auto_cache_images = auto_cache_images
-
+    def __init__(self, subdomain='slowed', user_id=None):
         self.subdomain = subdomain
         self._enforce_directories()
 
@@ -169,8 +159,13 @@ class Grid:
             self.user_id = self._grab_user_id_of_owner() \
                 if not user_id else user_id
 
+        self.metadata_filename = '{}.json'.format(self.subdomain)
+        self.metadata_filepath = ap(osp.join('meta', self.metadata_filename))
+
+        self._metadata_exists = lambda: osp.isfile(self.metadata_filepath)
+
     def _enforce_directories(self):
-        path = 'meta/{}/'.format(self.subdomain)
+        path = 'images/{}/'.format(self.subdomain)
         if not osp.isdir(path):
             os.makedirs(path)
 
@@ -244,13 +239,12 @@ class Grid:
 
         return urls
 
-    def _generate_images(self):
-        for meta in tqdm(self.metadata):
+    def _generate_images(self, cached_image_width=300):
+        for meta in tqdm(self.metadata.itervalues()):
             yield Image(
                 meta,
                 self.s,
-                cached_image_width=self.cached_image_width,
-                auto_download_file=self.auto_cache_images
+                cached_image_width=cached_image_width
             )
 
     def _cache_image_metadata(self):
@@ -258,6 +252,13 @@ class Grid:
         filename = '{}_{}.json'.format(self.subdomain, self.user_id)
         with open(filename, 'w') as f:
             json.dump(metadata, f, indent=4)
+
+    @property
+    def metadata(self):
+        if not getattr(self, '_metadata', None):
+            self._metadata = self.serialize_metadata()
+
+        return self.serialize_metadata()
 
     @property
     def grid_url(self):
@@ -322,9 +323,6 @@ class Grid:
         return ordered
 
     def download_metadata(self, n_threads=5):
-        grid_metadata_filename = '{}.json'.format(self.subdomain)
-        grid_metadata_filepath = ap(osp.join('meta', grid_metadata_filename))
-
         web_request_queue = Queue()
         json_serialization_queue = Queue()
 
@@ -343,7 +341,7 @@ class Grid:
             web_pool = [web_thread() for x in range(pool_size)]
             json_serializer = ThreadJSONWriter(
                 json_serialization_queue,
-                grid_metadata_filepath
+                self.metadata_filepath
             )
 
             for thread in web_pool:
@@ -360,16 +358,37 @@ class Grid:
             media_dict = list_of_dicts_to_dict(
                 media_entries, promote_to_key='_id')
 
-            exists = osp.isfile(grid_metadata_filepath)
+            exists = osp.isfile(self.metadata_filepath)
             filemode = 'r+w' if exists else 'w'
-            with open(grid_metadata_filepath, filemode) as f:
+            with open(self.metadata_filepath, filemode) as f:
                 try:
-                    cached_meta = json.load(f) if exists else {}
+                    cached_meta = load_json(f) if exists else {}
                 except ValueError:
                     cached_meta = {}
 
                 cached_meta.update(media_dict)
                 dump_json(cached_meta, f)
+                self._metadata = cached_meta
+
+    def serialize_metadata(self, return_iterator=False):
+        if self._metadata_exists():
+            with open(self.metadata_filepath, 'r') as f:
+                metadata = load_json(f)
+
+            return metadata
+
+    def cache_images(self):
+        image_queue = Queue()
+        for image in self._generate_images():
+            image_queue.put(image)
+
+        thread_pool = []
+        for i in range(8):
+            thread = ThreadCacheImageData(image_queue)
+            thread.start()
+            thread_pool.append(thread)
+
+        image_queue.join()
 
 
 if '__main__' in __name__:
@@ -392,6 +411,7 @@ if '__main__' in __name__:
                         )
     args = parser.parse_args()
 
-    grid = Grid(subdomain=args.subdomain, auto_cache_images=args.auto_cache)
+    grid = Grid(subdomain=args.subdomain)
 
     grid.download_metadata()
+    grid.cache_images()

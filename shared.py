@@ -73,9 +73,27 @@ def dump_json(dictionary, file_object):
 
     time_before_dump = dt.now()
 
+    file_object.seek(0)
     json.dump(dictionary, file_object, indent=4)
 
     how_long_was_i_dumping = td_format(dt.now() - time_before_dump)
 
     log.info('Finished dump of JSON metadata at {} in {}'
              .format(file_object.name, how_long_was_i_dumping))
+
+
+def load_json(file_object):
+    log = grab_logger()
+    log.debug('Starting JSON load of metadata at {}'
+              .format(file_object.name))
+
+    time_before_dump = dt.now()
+
+    dictionary = json.load(file_object)
+
+    how_long_was_i_dumping = td_format(dt.now() - time_before_dump)
+
+    log.info('Finished load of JSON metadata in {}'
+             .format(how_long_was_i_dumping))
+
+    return dictionary

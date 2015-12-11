@@ -22,6 +22,22 @@ class StoppableThread(threading.Thread):
         super(StoppableThread, self).join(timeout)
 
 
+class ThreadCacheImageData(threading.Thread):
+    def __init__(self, queue_in):
+        self.qi = queue_in
+        super(ThreadCacheImageData, self).__init__()
+
+    def run(self):
+        while True:
+            try:
+                image = self.qi.get(True, 0.05)
+            except Empty:
+                    continue
+            image.cache_image_file()
+
+            self.qi.task_done()
+
+
 class ThreadMetadataRequest(threading.Thread):
     def __init__(self, queue_in, queue_out, session=None):
         self.qi = queue_in
