@@ -14,7 +14,7 @@ from tqdm import tqdm
 from skimage import color
 from skimage import io
 
-from shared import ap, grab_logger
+from shared import ap, grab_logger, list_of_dicts_to_dict, dump_json
 from threads import ThreadJSONWriter, ThreadMetadataRequest
 from analyzer import Analyzer
 
@@ -162,7 +162,7 @@ class Grid:
                               AppleWebKit/537.75.14 (KHTML, like Gecko)
                               Version/7.0.3 Safari/7046A194A'''
         })
-
+        self.session.cookies.set('vs', self.access_token, domain='vsco.co')
         if self.subdomain == 'grid':
             self.user_id = self.vsco_grid_site_id
         else:
@@ -217,30 +217,30 @@ class Grid:
             log.debug('couldn\'t get the token out of: {}'
                       .format(tokenized_url))
 
-    def _media_urls(self, page_limit=None, page_size=1000):
-        media_url_formatter = lambda token, uid, page: \
+    def _fetch_media_urls(self, page_limit=None, page_size=1000):
+        media_url_formatter = lambda token, uid, page, size: \
             'https://vsco.co/ajxp/{}/2.0/medias?site_id={}&page={}&size={}'\
-            .format(token, uid, page, page_size)
+            .format(token, uid, page, size)
 
-        media_url_formatter__page = lambda page: \
+        media_url_formatter__page = lambda page, size: \
             media_url_formatter(
                 self.access_token,
                 self.user_id,
-                page
+                page,
+                size
             )
 
-        media_meta_url = media_url_formatter__page(1)
-        log.debug('grabbing json response from: {}'.format(media_meta_url))
+        media_meta_url = media_url_formatter__page(1, 1)
+        log.debug('Grabbing json response from: {}'.format(media_meta_url))
 
         media_meta = self._grab_json(media_meta_url)
-        mm_remaining_count = media_meta['total'] - media_meta['size']
+        mm_remaining_count = media_meta['total']
 
+        page_limit_max = int(math.ceil(mm_remaining_count / float(page_size)))
+        n_pages = min(page_limit, page_limit_max) if page_limit else page_limit_max
         urls = []
-        if mm_remaining_count > 0:
-            if not page_limit:
-                page_limit = int(math.ceil(mm_remaining_count / 1000))
-            for page in range(1, page_limit):
-                urls.append(media_url_formatter__page(page))
+        for page in range(1, n_pages + 1):
+            urls.append(media_url_formatter__page(page, page_size))
 
         return urls
 
@@ -269,6 +269,7 @@ class Grid:
         token = self.s.cookies.get('vs', domain='vsco.co', default=None)
         if not token:
             token = self._grab_token()
+            log.debug('Access token grabbed and is: {}'.format(token))
             self.s.cookies.set('vs', token, domain='vsco.co')
         return token
 
@@ -278,7 +279,11 @@ class Grid:
 
     @property
     def paginated_media_urls(self):
-        return self._media_urls()
+        if not getattr(self, '_media_urls', None):
+            self._media_urls = self._fetch_media_urls()
+            log.debug('Built media urls up to page {}'
+                      .format(len(self._media_urls)))
+        return self._media_urls
 
     def grid_page_url(self, page):
         return self.grid_url.replace('/1', '/{}'.format(page))
@@ -323,29 +328,48 @@ class Grid:
         web_request_queue = Queue()
         json_serialization_queue = Queue()
 
-        for url in self._media_urls():
-            web_request_queue.put(url)
+        urls = self.paginated_media_urls
+        if len(urls) > 1:
+            for url in urls:
+                web_request_queue.put(url)
 
-        web_thread = lambda: ThreadMetadataRequest(
-            web_request_queue,
-            json_serialization_queue,
-            self.s
-        )
+            web_thread = lambda: ThreadMetadataRequest(
+                web_request_queue,
+                json_serialization_queue,
+                self.session
+            )
 
-        pool_size = min(len(self._media_urls()), n_threads)
-        web_pool = [web_thread() for x in range(pool_size)]
-        json_serializer = ThreadJSONWriter(
-            json_serialization_queue,
-            grid_metadata_filepath
-        )
+            pool_size = min(len(urls), n_threads)
+            web_pool = [web_thread() for x in range(pool_size)]
+            json_serializer = ThreadJSONWriter(
+                json_serialization_queue,
+                grid_metadata_filepath
+            )
 
-        for thread in web_pool:
-            thread.setDaemon(True)
-            thread.start()
-        json_serializer.start()
+            for thread in web_pool:
+                thread.setDaemon(True)
+                thread.start()
+            json_serializer.start()
 
-        web_request_queue.join()
-        json_serialization_queue.join()
+            web_request_queue.join()
+            json_serialization_queue.join()
+        else:
+            json_response = self._grab_json(urls[0])
+            media_entries = json_response['media']
+
+            media_dict = list_of_dicts_to_dict(
+                media_entries, promote_to_key='_id')
+
+            exists = osp.isfile(grid_metadata_filepath)
+            filemode = 'r+w' if exists else 'w'
+            with open(grid_metadata_filepath, filemode) as f:
+                try:
+                    cached_meta = json.load(f) if exists else {}
+                except ValueError:
+                    cached_meta = {}
+
+                cached_meta.update(media_dict)
+                dump_json(cached_meta, f)
 
 
 if '__main__' in __name__:
