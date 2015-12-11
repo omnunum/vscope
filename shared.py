@@ -35,18 +35,22 @@ def td_format(td_object):
 
 def grab_logger():
     log = logging.getLogger('vscope')
-    log.setLevel(logging.DEBUG)
 
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    if not log.handlers:
+        log.setLevel(logging.DEBUG)
 
-    fh = logging.FileHandler('vscope_log.txt')
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
-    log.addHandler(fh)
+        formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s'
+        )
 
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    ch.setFormatter(formatter)
-    log.addHandler(ch)
+        fh = logging.FileHandler('vscope_log.txt')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(formatter)
+        log.addHandler(fh)
+
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.DEBUG)
+        ch.setFormatter(formatter)
+        log.addHandler(ch)
 
     return log

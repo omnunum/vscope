@@ -61,7 +61,8 @@ class ThreadJSONWriter(StoppableThread):
         self.file_exists = osp.isfile(filename)
         self.dumped = False
         super(ThreadJSONWriter, self).__init__()
-        readable_exists = ('does' if self.file_exists else 'does not')
+
+        readable_exists = ('does indeed' if self.file_exists else 'does not')
         log.debug('Initializing ThreadJSONWriter: file {} already exist at {}'
                   .format(readable_exists, self.filename))
 
