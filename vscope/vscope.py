@@ -256,9 +256,9 @@ class Grid:
     @property
     def metadata(self):
         if not getattr(self, '_metadata', None):
-            self._metadata = self.serialize_metadata()
+            self._metadata = self.deserialize_metadata()
 
-        return self.serialize_metadata()
+        return self.deserialize_metadata()
 
     @property
     def grid_url(self):
@@ -370,14 +370,14 @@ class Grid:
                 dump_json(cached_meta, f)
                 self._metadata = cached_meta
 
-    def serialize_metadata(self, return_iterator=False):
+    def deserialize_metadata(self, return_iterator=False):
         if self._metadata_exists():
             with open(self.metadata_filepath, 'r') as f:
                 metadata = load_json(f)
 
             return metadata
 
-    def cache_images(self):
+    def cache_all_image_data(self):
         image_queue = Queue()
         for image in self._generate_images():
             image_queue.put(image)
@@ -414,4 +414,4 @@ if '__main__' in __name__:
     grid = Grid(subdomain=args.subdomain)
 
     grid.download_metadata()
-    grid.cache_images()
+    grid.cache_all_image_data()
