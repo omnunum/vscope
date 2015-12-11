@@ -1,26 +1,24 @@
+from collections import defaultdict, OrderedDict
+from os import path as osp
+from Queue import Queue
+import re
+import json
+import os
+import math
+
+import argparse
 import requests as rq
 from requests.status_codes import codes
 from bs4 import BeautifulSoup as bs
 from tqdm import tqdm
-
-import re
-import json
-from collections import defaultdict, OrderedDict
-from os import path as osp
-import os
-import sys
-
-from pprint import pprint as pp
-import argparse
 from skimage import color
 from skimage import io
-from sklearn import cluster
-import numpy as np
-import math
-from threading import Thread
-import threading
-from Queue import Queue
-from Queue import Empty
+
+from .shared import ap, grab_logger
+from .threads import ThreadJSONWriter, ThreadMetadataRequest
+from .analyzer import Analyzer
+
+log = grab_logger()
 
 
 class Image:
@@ -286,19 +284,20 @@ class Grid:
                 values[image._id] = attribute_value
         return values
 
-    def histogram_attribute(self,
-                            attribute,
-                            proportional_values=False,
-                            ascending=False
-                            ):
+    def attribute_freq(self,
+                       attribute,
+                       proportional_values=False,
+                       ascending=False
+                       ):
         histogram = defaultdict(int)
         attributes = self.grab_attribute_from_all_images(attribute)
         for v in attributes.values():
             histogram[v] += 1
 
         if proportional_values:
-            total = float(len(attributes))
-            histogram = {k: (v / total) for k, v in histogram.iteritems()}
+            total = len(attributes)
+            prop = lambda v: (v / float(total))
+            histogram = {k: prop(v) for k, v in histogram.iteritems()}
 
         items = histogram.items()
         items_sorted = sorted(
@@ -310,122 +309,35 @@ class Grid:
 
         return ordered
 
+    def download_metadata(self):
+        grid_metadata_filename = '{}.json'.format(self.subdomain)
+        grid_metadata_filepath = ap(osp.join('meta', grid_metadata_filename))
 
-class Analyzer:
-    def __init__(self, grid, *args, **kwargs):
-        pass
+        web_request_queue = Queue()
+        json_serializing_queue = Queue()
 
-    @staticmethod
-    def find_primary_colors(image, resolve_to_n_colors=20):
-        k = resolve_to_n_colors
-        lab = image.data_array_lab
-        shape = lab.shape
+        for url in self._media_urls():
+            web_request_queue.put(url)
 
-        centroids, centroid_ixs, intertia = cluster.k_means(
-            np.reshape(lab, (shape[0] * shape[1], shape[2])),
-            k
+        web_thread = lambda: ThreadMetadataRequest(
+            web_request_queue,
+            json_serializing_queue,
+            self.s
         )
 
-        hist = np.histogram(centroid_ixs, bins=k, range=[0, k])
-        freqs = hist[0].tolist()
-        bins = hist[1].astype(int).tolist()
-
-        sorted_hist = sorted(
-            zip(bins, freqs),
-            key=lambda x: x[1],
-            reverse=True
+        web_pool = [web_thread() for x in range(thread_pool_size)]
+        json_serializer = ThreadJSONWriter(
+            json_serializing_queue,
+            grid_metadata_filepath
         )
 
-        top_centroids_ixs = [x[0] for x in sorted_hist]
-        top_colors_lab = [centroids[c] for c in top_centroids_ixs]
-        lab_shaped = np.reshape(top_colors_lab, (1, k, 3))
-        top_colors_rgb = (color.lab2rgb(lab_shaped) * 255).astype(int)
+        for thread in web_pool:
+            thread.setDaemon(True)
+            thread.start()
+        json_serializer.start()
 
-        return top_colors_rgb
-
-
-class StoppableThread(Thread):
-    def __init__(self):
-        super(StoppableThread, self).__init__()
-        self.stoprequest = threading.Event()
-
-    def join(self, timeout=None):
-        self.stoprequest.set()
-        super(StoppableThread, self).join(timeout)
-
-
-class ThreadMetadataRequest(Thread):
-    def __init__(self, queue_in, queue_out, session=None):
-        self.qi = queue_in
-        self.qo = queue_out
-        self.s = session
-        super(ThreadMetadataRequest, self).__init__()
-
-    def run(self):
-        i = 1
-        while True:
-            try:
-                url = self.qi.get(True, 0.05)
-            except Empty:
-                    continue
-            if self.s:
-                r = self.s.get(url)
-            else:
-                r = rq.get(url)
-            if r.status_code == codes.all_good:
-                json_response = r.json()
-                media_entries = json_response['media']
-
-                # the entries come in to us as a list of dictionaries, and we
-                # need to be able to retrieve individual entries via a key,
-                # so we'll promote the '_id' attribute of the entry to be the
-                # lookup key
-                media_dict = {}
-                for entry in media_entries:
-                    media_dict[entry['_id']] = entry
-                print('queued page {} for saving'.format(i))
-                i += 1
-                self.qo.put(media_dict)
-            self.qi.task_done()
-
-
-class ThreadJSONWriter(StoppableThread):
-    def __init__(self, queue_in, filename):
-        self.filename = filename
-        self.qi = queue_in
-        self.file_exists = osp.isfile(filename)
-        self.dumped = False
-        super(ThreadJSONWriter, self).__init__()
-
-    def run(self):
-        filemode = 'r+w' if self.file_exists else 'w'
-        i = 1
-        with open(self.filename, filemode) as f:
-            try:
-                metadata_dict = json.load(f) if self.file_exists else {}
-            except ValueError:
-                metadata_dict = {}
-
-            while not self.stoprequest.isSet():
-                try:
-                    json_chunk = self.qi.get(True, 0.5)
-                except Empty:
-                    continue
-
-                metadata_dict.update(json_chunk)
-                print('Updated dict with page: {}'.format(i))
-                i += 1
-                self.qi.task_done()
-
-            json.dump(metadata_dict, f, indent=4)
-            print('dumped')
-
-
-def ap(path):
-    """
-        Gets the absolute path of the directory and appends the path to it.
-    """
-    return osp.join(osp.dirname(osp.abspath(sys.argv[0])), path)
+        web_request_queue.join()
+        json_serializing_queue.join()
 
 
 if '__main__' in __name__:
@@ -451,31 +363,3 @@ if '__main__' in __name__:
     args = parser.parse_args()
 
     grid = Grid(subdomain=args.subdomain, auto_cache_images=args.auto_cache)
-    grid_metadata_filename = '{}.json'.format(args.subdomain)
-    grid_metadata_filepath = ap(osp.join('meta', grid_metadata_filename))
-
-    web_request_queue = Queue()
-    json_serializing_queue = Queue()
-
-    for url in grid._media_urls():
-        web_request_queue.put(url)
-
-    web_thread = lambda: ThreadMetadataRequest(
-        web_request_queue,
-        json_serializing_queue,
-        grid.session
-    )
-
-    web_pool = [web_thread() for x in range(thread_pool_size)]
-    json_serializer = ThreadJSONWriter(
-        json_serializing_queue,
-        grid_metadata_filepath
-    )
-
-    for thread in web_pool:
-        thread.setDaemon(True)
-        thread.start()
-    json_serializer.start()
-
-    web_request_queue.join()
-    json_serializing_queue.join()
