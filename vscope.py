@@ -19,7 +19,7 @@ import numpy as np
 import math
 from threading import Thread
 import threading
-from multiprocessing import Queue
+from Queue import Queue
 from Queue import Empty
 
 
@@ -226,16 +226,15 @@ class Grid:
 
         media_meta_url = media_url_formatter__page(1)
         print('media_meta_url is : {}'.format(media_meta_url))
-        media_meta = mm = self._grab_json(media_meta_url)
-        pp(media_meta, indent=4)
-        media_meta_all = media_meta['media']
 
-        mm_remaining_count = mm['total'] - mm['size']
-        if not page_limit:
-            page_limit = int(math.ceil(mm_remaining_count / 1000))
+        media_meta = self._grab_json(media_meta_url)
+        mm_remaining_count = media_meta['total'] - media_meta['size']
+
         urls = []
         if mm_remaining_count > 0:
-            for page in range(2, page_limit):
+            if not page_limit:
+                page_limit = int(math.ceil(mm_remaining_count / 1000))
+            for page in range(1, page_limit):
                 urls.append(media_url_formatter__page(page))
 
         return urls
@@ -272,11 +271,12 @@ class Grid:
     def size(self):
         return len(self.images)
 
-    def paginated_media_urls(self, page_limit=None):
-        return self._media_urls(page_limit=page_limit)
+    @property
+    def paginated_media_urls(self):
+        return self._media_urls()
 
     def grid_page_url(self, page):
-        return self.grid_url.replace('1', str(page))
+        return self.grid_url.replace('/1', '/{}'.format(page))
 
     def grab_attribute_from_all_images(self, attribute):
         values = {}
@@ -354,15 +354,16 @@ class StoppableThread(Thread):
         super(StoppableThread, self).join(timeout)
 
 
-class ThreadWebRequest(StoppableThread):
+class ThreadMetadataRequest(Thread):
     def __init__(self, queue_in, queue_out, session=None):
         self.qi = queue_in
         self.qo = queue_out
         self.s = session
-        super(ThreadWebRequest, self).__init__()
+        super(ThreadMetadataRequest, self).__init__()
 
     def run(self):
-        while not self.stoprequest.isSet():
+        i = 1
+        while True:
             try:
                 url = self.qi.get(True, 0.05)
             except Empty:
@@ -375,11 +376,17 @@ class ThreadWebRequest(StoppableThread):
                 json_response = r.json()
                 media_entries = json_response['media']
 
+                # the entries come in to us as a list of dictionaries, and we
+                # need to be able to retrieve individual entries via a key,
+                # so we'll promote the '_id' attribute of the entry to be the
+                # lookup key
                 media_dict = {}
                 for entry in media_entries:
                     media_dict[entry['_id']] = entry
-
+                print('queued page {} for saving'.format(i))
+                i += 1
                 self.qo.put(media_dict)
+            self.qi.task_done()
 
 
 class ThreadJSONWriter(StoppableThread):
@@ -387,11 +394,12 @@ class ThreadJSONWriter(StoppableThread):
         self.filename = filename
         self.qi = queue_in
         self.file_exists = osp.isfile(filename)
+        self.dumped = False
         super(ThreadJSONWriter, self).__init__()
 
     def run(self):
-        filemode = 'rw+' if self.file_exists else 'w'
-        i = 0
+        filemode = 'r+w' if self.file_exists else 'w'
+        i = 1
         with open(self.filename, filemode) as f:
             try:
                 metadata_dict = json.load(f) if self.file_exists else {}
@@ -400,13 +408,17 @@ class ThreadJSONWriter(StoppableThread):
 
             while not self.stoprequest.isSet():
                 try:
-                    json_chunk = self.qi.get(True, 0.05)
+                    json_chunk = self.qi.get(True, 0.5)
                 except Empty:
                     continue
+
                 metadata_dict.update(json_chunk)
                 print('Updated dict with page: {}'.format(i))
                 i += 1
+                self.qi.task_done()
+
             json.dump(metadata_dict, f, indent=4)
+            print('dumped')
 
 
 def ap(path):
@@ -445,10 +457,10 @@ if '__main__' in __name__:
     web_request_queue = Queue()
     json_serializing_queue = Queue()
 
-    for url in grid.paginated_media_urls():
+    for url in grid._media_urls():
         web_request_queue.put(url)
 
-    web_thread = lambda: ThreadWebRequest(
+    web_thread = lambda: ThreadMetadataRequest(
         web_request_queue,
         json_serializing_queue,
         grid.session
@@ -461,9 +473,9 @@ if '__main__' in __name__:
     )
 
     for thread in web_pool:
+        thread.setDaemon(True)
         thread.start()
     json_serializer.start()
 
-    for thread in web_pool:
-        thread.join()
-    json_serializer.join()
+    web_request_queue.join()
+    json_serializing_queue.join()
