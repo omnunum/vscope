@@ -14,9 +14,9 @@ from tqdm import tqdm
 from skimage import color
 from skimage import io
 
-from .shared import ap, grab_logger
-from .threads import ThreadJSONWriter, ThreadMetadataRequest
-from .analyzer import Analyzer
+from shared import ap, grab_logger
+from threads import ThreadJSONWriter, ThreadMetadataRequest
+from analyzer import Analyzer
 
 log = grab_logger()
 
@@ -193,28 +193,35 @@ class Grid:
         soup = self._grab_html_soup(self.grid_url)
         soup_meta = soup.find_all('meta', property='al:ios:url')
         user_app_url = soup_meta[0].get('content', None)
+
         matcher = 'user/(?P<user_id>\d+)/grid'
         match = re.search(matcher, user_app_url)
+
         if match:
             return match.group('user_id')
         else:
-            print('couldn\'t get the user_id out of: {}'.format(user_app_url))
+            log.debug('couldn\'t get the user_id out of: {}'
+                      .format(user_app_url))
 
     def _grab_token(self):
         soup = self._grab_html_soup(self.vsco_grid_url)
         soup_meta = soup.find_all('meta', property='og:image')
         tokenized_url = soup_meta[0].get('content', None)
+
         matcher = 'https://im.vsco.co/\d/[0-9a-fA-F]*/(?P<token>[0-9a-fA-F]*)/'
         match = re.search(matcher, tokenized_url)
+
         if match:
             return match.group('token')
         else:
-            print('couldn\'t get the token out of: {}'.format(tokenized_url))
+            log.debug('couldn\'t get the token out of: {}'
+                      .format(tokenized_url))
 
     def _media_urls(self, page_limit=None, page_size=1000):
         media_url_formatter = lambda token, uid, page: \
             'https://vsco.co/ajxp/{}/2.0/medias?site_id={}&page={}&size={}'\
             .format(token, uid, page, page_size)
+
         media_url_formatter__page = lambda page: \
             media_url_formatter(
                 self.access_token,
@@ -223,7 +230,7 @@ class Grid:
             )
 
         media_meta_url = media_url_formatter__page(1)
-        print('media_meta_url is : {}'.format(media_meta_url))
+        log.debug('media_meta_url is : {}'.format(media_meta_url))
 
         media_meta = self._grab_json(media_meta_url)
         mm_remaining_count = media_meta['total'] - media_meta['size']
@@ -309,25 +316,25 @@ class Grid:
 
         return ordered
 
-    def download_metadata(self):
+    def download_metadata(self, n_threads=5):
         grid_metadata_filename = '{}.json'.format(self.subdomain)
         grid_metadata_filepath = ap(osp.join('meta', grid_metadata_filename))
 
         web_request_queue = Queue()
-        json_serializing_queue = Queue()
+        json_serialization_queue = Queue()
 
         for url in self._media_urls():
             web_request_queue.put(url)
 
         web_thread = lambda: ThreadMetadataRequest(
             web_request_queue,
-            json_serializing_queue,
+            json_serialization_queue,
             self.s
         )
 
-        web_pool = [web_thread() for x in range(thread_pool_size)]
+        web_pool = [web_thread() for x in range(n_threads)]
         json_serializer = ThreadJSONWriter(
-            json_serializing_queue,
+            json_serialization_queue,
             grid_metadata_filepath
         )
 
@@ -337,14 +344,12 @@ class Grid:
         json_serializer.start()
 
         web_request_queue.join()
-        json_serializing_queue.join()
+        json_serialization_queue.join()
 
 
 if '__main__' in __name__:
-    thread_pool_size = 5
-
     parser = argparse.ArgumentParser(prog='PROG')
-    parser.add_argument('subdomain',
+    parser.add_argument('--subdomain',
                         help='''Can be either the subdomain
                          or full url of anything with the subdomain in it''',
                         default='slowed'
@@ -363,3 +368,5 @@ if '__main__' in __name__:
     args = parser.parse_args()
 
     grid = Grid(subdomain=args.subdomain, auto_cache_images=args.auto_cache)
+
+    grid.download_metadata()

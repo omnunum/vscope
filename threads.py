@@ -1,4 +1,4 @@
-from time import now
+from datetime import datetime as dt
 from os import path as osp
 from Queue import Empty
 import threading
@@ -7,7 +7,7 @@ import json
 from requests.status_codes import codes
 import requests as rq
 
-from .shared import ap, td_format, grab_logger
+from shared import ap, td_format, grab_logger
 
 log = grab_logger()
 
@@ -62,8 +62,8 @@ class ThreadJSONWriter(StoppableThread):
         self.dumped = False
         super(ThreadJSONWriter, self).__init__()
         readable_exists = ('does' if self.file_exists else 'does not')
-        log.debug('''Initializing ThreadJSONWriter: file {} already exist at
-                        {}'''.format(self.filename, readable_exists))
+        log.debug('Initializing ThreadJSONWriter: file {} already exist at {}'
+                  .format(readable_exists, self.filename))
 
     def run(self):
         filemode = 'r+w' if self.file_exists else 'w'
@@ -85,14 +85,14 @@ class ThreadJSONWriter(StoppableThread):
                 i += 1
                 self.qi.task_done()
 
-            log.info('''Starting JSON dump of metadata, {} total
-                             records'''.format(len(metadata_dict)))
+            log.info('Starting JSON dump of metadata, {} total \
+                      records'.format(len(metadata_dict)))
 
-            time_before_dump = now()
+            time_before_dump = dt.now()
 
             json.dump(metadata_dict, f, indent=4)
 
-            how_long_was_i_dumping = td_format(now() - time_before_dump)
+            how_long_was_i_dumping = td_format(dt.now() - time_before_dump)
 
-            log.info('''Finished dump of JSON metadata at {} in {}
-                         '''.format(self.filename, how_long_was_i_dumping))
+            log.info('Finished dump of JSON metadata at {} in {}'
+                     .format(self.filename, how_long_was_i_dumping))
