@@ -230,7 +230,7 @@ class Grid:
             )
 
         media_meta_url = media_url_formatter__page(1)
-        log.debug('media_meta_url is : {}'.format(media_meta_url))
+        log.debug('media_meta_url is: {}'.format(media_meta_url))
 
         media_meta = self._grab_json(media_meta_url)
         mm_remaining_count = media_meta['total'] - media_meta['size']
@@ -331,8 +331,9 @@ class Grid:
             json_serialization_queue,
             self.s
         )
-
-        web_pool = [web_thread() for x in range(n_threads)]
+        
+        pool_size = min(len(self._media_urls()), n_threads)
+        web_pool = [web_thread() for x in range(pool_size)]
         json_serializer = ThreadJSONWriter(
             json_serialization_queue,
             grid_metadata_filepath

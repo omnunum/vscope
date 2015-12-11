@@ -85,8 +85,8 @@ class ThreadJSONWriter(StoppableThread):
                 i += 1
                 self.qi.task_done()
 
-            log.info('Starting JSON dump of metadata, {} total \
-                      records'.format(len(metadata_dict)))
+            log.info('Starting JSON dump of metadata, {} total records'
+                     .format(len(metadata_dict)))
 
             time_before_dump = dt.now()
 
